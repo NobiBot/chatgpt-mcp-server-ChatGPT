@@ -1,5 +1,8 @@
+// src/mcp.server.ts (or wherever this class lives)
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { HttpServerTransport } from '@modelcontextprotocol/sdk/server/http.js'; // <-- add this
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -17,7 +20,7 @@ export class McpServer {
   private config: ConfigService;
   private requestCount: number = 0;
   private lastRequestTime: number = Date.now();
-  private transport: StdioServerTransport | null = null;
+  private transport: StdioServerTransport | HttpServerTransport | null = null; // <-- widened type
   private activeRequests = new Set<Promise<any>>();
   private isShuttingDown = false;
 
@@ -318,9 +321,29 @@ export class McpServer {
 
   async start(): Promise<void> {
     try {
-      this.transport = new StdioServerTransport();
-      await this.server.connect(this.transport);
-      console.log('MCP server running on stdio');
+      const useHttp =
+        (process.env.MCP_TRANSPORT ?? '').toLowerCase() === 'http' ||
+        !!process.env.HTTP_PORT;
+
+      if (useHttp) {
+        const port = parseInt(process.env.HTTP_PORT ?? '3001', 10);
+        const host = process.env.HTTP_HOST ?? '0.0.0.0';
+
+        this.transport = new HttpServerTransport({
+          port,
+          host,
+          // You can add CORS or auth here if you need:
+          // cors: { origin: '*', methods: ['GET','POST'] },
+          // auth: async (req) => { ... }
+        });
+
+        await this.server.connect(this.transport);
+        console.log(`MCP server (HTTP/SSE) listening at http://${host}:${port}`);
+      } else {
+        this.transport = new StdioServerTransport();
+        await this.server.connect(this.transport);
+        console.log('MCP server running on stdio');
+      }
     } catch (error) {
       console.error('Failed to start MCP server:', error);
       throw error;
@@ -337,7 +360,6 @@ export class McpServer {
       }, SHUTDOWN_TIMEOUT);
 
       try {
-        // Wait for active requests to complete
         if (this.activeRequests.size > 0) {
           console.log(`Waiting for ${this.activeRequests.size} active requests to complete...`);
           await Promise.race([
@@ -346,7 +368,6 @@ export class McpServer {
           ]);
         }
 
-        // Clean up resources
         if (this.transport) {
           await this.server.close();
           this.transport = null;
