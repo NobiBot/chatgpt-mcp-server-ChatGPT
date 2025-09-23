@@ -2,7 +2,7 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { HttpServerTransport } from '@modelcontextprotocol/sdk/server/http.js'; // <-- add this
+import { HttpServerTransport } from '@modelcontextprotocol/sdk/server/http.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
