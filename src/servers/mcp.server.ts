@@ -1,8 +1,9 @@
-// src/mcp.server.ts (or wherever this class lives)
+import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { URL } from 'node:url';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { HttpServerTransport } from '@modelcontextprotocol/sdk/http.js';
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -13,6 +14,9 @@ import { DockerService } from '../services/docker.service.js';
 import { ConfigService } from '../services/config.service.js';
 
 const SHUTDOWN_TIMEOUT = 5000; // 5 seconds
+const SSE_STREAM_PATH = '/sse';
+const SSE_MESSAGE_PATH = '/message';
+const HEALTH_PATH = '/health';
 
 export class McpServer {
   private server: Server;
@@ -20,9 +24,13 @@ export class McpServer {
   private config: ConfigService;
   private requestCount: number = 0;
   private lastRequestTime: number = Date.now();
-  private transport: StdioServerTransport | HttpServerTransport | null = null; // <-- widened type
+  private transport: StdioServerTransport | SSEServerTransport | null = null;
   private activeRequests = new Set<Promise<any>>();
   private isShuttingDown = false;
+  private httpServer: ReturnType<typeof createServer> | null = null;
+  private sseTransport: SSEServerTransport | null = null;
+  private httpHost: string | null = null;
+  private httpPort: number | null = null;
 
   constructor(dockerService: DockerService) {
     this.dockerService = dockerService;
@@ -221,9 +229,11 @@ export class McpServer {
 
       const toolRequest = (async () => {
         try {
+          const args = request.params.arguments ?? {};
+
           switch (request.params.name) {
             case 'containers_list': {
-              const { all } = request.params.arguments as { all?: boolean };
+              const { all } = args as { all?: boolean };
               const output = await this.dockerService.listContainers(all);
               return {
                 content: [{ type: 'text', text: output }],
@@ -231,7 +241,7 @@ export class McpServer {
             }
 
             case 'container_create': {
-              const { image, name, ports, env } = request.params.arguments as {
+              const { image, name, ports, env } = args as {
                 image: string;
                 name?: string;
                 ports?: string[];
@@ -250,7 +260,7 @@ export class McpServer {
             }
 
             case 'container_stop': {
-              const { container } = request.params.arguments as { container: string };
+              const { container } = args as { container: string };
               const output = await this.dockerService.stopContainer(container);
               return {
                 content: [{ type: 'text', text: `Container stopped: ${output}` }],
@@ -258,7 +268,7 @@ export class McpServer {
             }
 
             case 'container_start': {
-              const { container } = request.params.arguments as { container: string };
+              const { container } = args as { container: string };
               const output = await this.dockerService.startContainer(container);
               return {
                 content: [{ type: 'text', text: `Container started: ${output}` }],
@@ -266,7 +276,7 @@ export class McpServer {
             }
 
             case 'container_remove': {
-              const { container, force } = request.params.arguments as {
+              const { container, force } = args as {
                 container: string;
                 force?: boolean;
               };
@@ -277,7 +287,7 @@ export class McpServer {
             }
 
             case 'container_logs': {
-              const { container, tail } = request.params.arguments as {
+              const { container, tail } = args as {
                 container: string;
                 tail?: number;
               };
@@ -288,7 +298,7 @@ export class McpServer {
             }
 
             case 'container_exec': {
-              const { container, command } = request.params.arguments as {
+              const { container, command } = args as {
                 container: string;
                 command: string;
               };
@@ -319,8 +329,141 @@ export class McpServer {
     });
   }
 
+  private setCorsHeaders(res: ServerResponse): void {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,X-API-Key');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  }
+
+  private extractApiKey(req: IncomingMessage): string | null {
+    const header = req.headers['x-api-key'];
+    if (Array.isArray(header)) {
+      return header[0] ?? null;
+    }
+    return typeof header === 'string' ? header : null;
+  }
+
+  private isAuthorized(req: IncomingMessage): boolean {
+    return this.extractApiKey(req) === this.config.apiKey;
+  }
+
+  private async handleSseHandshake(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (this.isShuttingDown) {
+      res.writeHead(503).end('Server is shutting down');
+      return;
+    }
+
+    if (!this.isAuthorized(req)) {
+      res.writeHead(401).end('Unauthorized');
+      return;
+    }
+
+    if (this.transport) {
+      try {
+        await this.server.close();
+      } catch (error) {
+        console.error('Error closing existing transport before new SSE connection:', error);
+      }
+      this.transport = null;
+      this.sseTransport = null;
+    }
+
+    const transport = new SSEServerTransport(SSE_MESSAGE_PATH, res);
+    this.transport = transport;
+    this.sseTransport = transport;
+
+    transport.onclose = () => {
+      this.transport = null;
+      this.sseTransport = null;
+    };
+
+    transport.onerror = (error) => {
+      console.error('[SSE Transport Error]', error);
+    };
+
+    this.setCorsHeaders(res);
+
+    try {
+      await this.server.connect(transport);
+    } catch (error) {
+      console.error('Failed to establish SSE connection:', error);
+      if (!res.headersSent) {
+        res.writeHead(500).end('Failed to establish SSE connection');
+      }
+      this.transport = null;
+      this.sseTransport = null;
+    }
+  }
+
+  private async handleSseMessage(req: IncomingMessage, res: ServerResponse, requestUrl: URL): Promise<void> {
+    if (!this.isAuthorized(req)) {
+      res.writeHead(401).end('Unauthorized');
+      return;
+    }
+
+    const sessionId = requestUrl.searchParams.get('sessionId');
+    if (!sessionId || !this.sseTransport || this.sseTransport.sessionId !== sessionId) {
+      res.writeHead(404).end('Session not found');
+      return;
+    }
+
+    this.setCorsHeaders(res);
+
+    try {
+      await this.sseTransport.handlePostMessage(req, res);
+    } catch (error) {
+      console.error('Error handling SSE message:', error);
+      if (!res.headersSent) {
+        res.writeHead(500).end('Internal Server Error');
+      }
+    }
+  }
+
+  private async handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    try {
+      if (!req.url) {
+        res.writeHead(404).end('Not Found');
+        return;
+      }
+
+      const hostHeader = req.headers.host ?? `${this.httpHost ?? 'localhost'}:${this.httpPort ?? 0}`;
+      const requestUrl = new URL(req.url, `http://${hostHeader}`);
+
+      if (req.method === 'OPTIONS') {
+        this.setCorsHeaders(res);
+        res.writeHead(204).end();
+        return;
+      }
+
+      if (req.method === 'GET' && requestUrl.pathname === HEALTH_PATH) {
+        this.setCorsHeaders(res);
+        res.writeHead(200).end('ok');
+        return;
+      }
+
+      if (req.method === 'GET' && requestUrl.pathname === SSE_STREAM_PATH) {
+        await this.handleSseHandshake(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && requestUrl.pathname === SSE_MESSAGE_PATH) {
+        await this.handleSseMessage(req, res, requestUrl);
+        return;
+      }
+
+      this.setCorsHeaders(res);
+      res.writeHead(404).end('Not Found');
+    } catch (error) {
+      console.error('HTTP request handling error:', error);
+      if (!res.headersSent) {
+        res.writeHead(500).end('Internal Server Error');
+      }
+    }
+  }
+
   async start(): Promise<void> {
     try {
+      this.isShuttingDown = false;
       const useHttp =
         (process.env.MCP_TRANSPORT ?? '').toLowerCase() === 'http' ||
         !!process.env.HTTP_PORT;
@@ -328,22 +471,38 @@ export class McpServer {
       if (useHttp) {
         const port = parseInt(process.env.HTTP_PORT ?? '3001', 10);
         const host = process.env.HTTP_HOST ?? '0.0.0.0';
+        this.httpHost = host;
+        this.httpPort = port;
 
-        this.transport = new HttpServerTransport({
-          port,
-          host,
-          // You can add CORS or auth here if you need:
-          // cors: { origin: '*', methods: ['GET','POST'] },
-          // auth: async (req) => { ... }
+        this.httpServer = createServer((req, res) => {
+          this.handleHttpRequest(req, res).catch((error) => {
+            console.error('Unhandled error in HTTP request handler:', error);
+            if (!res.headersSent) {
+              res.writeHead(500).end('Internal Server Error');
+            }
+          });
         });
 
-        await this.server.connect(this.transport);
-        console.log(`MCP server (HTTP/SSE) listening at http://${host}:${port}`);
-      } else {
-        this.transport = new StdioServerTransport();
-        await this.server.connect(this.transport);
-        console.log('MCP server running on stdio');
+        await new Promise<void>((resolve, reject) => {
+          if (!this.httpServer) {
+            reject(new Error('HTTP server not initialized'));
+            return;
+          }
+
+          this.httpServer.once('error', reject);
+          this.httpServer.listen(port, host, () => {
+            this.httpServer?.off('error', reject);
+            resolve();
+          });
+        });
+
+        console.log(`MCP server (HTTP/SSE) listening at http://${host === '0.0.0.0' ? 'localhost' : host}:${port}${SSE_STREAM_PATH}`);
+        return;
       }
+
+      this.transport = new StdioServerTransport();
+      await this.server.connect(this.transport);
+      console.log('MCP server running on stdio');
     } catch (error) {
       console.error('Failed to start MCP server:', error);
       throw error;
@@ -371,6 +530,22 @@ export class McpServer {
         if (this.transport) {
           await this.server.close();
           this.transport = null;
+          this.sseTransport = null;
+        }
+
+        if (this.httpServer) {
+          await new Promise<void>((httpResolve, httpReject) => {
+            this.httpServer?.close((err) => {
+              if (err) {
+                httpReject(err);
+              } else {
+                httpResolve();
+              }
+            });
+          });
+          this.httpServer = null;
+          this.httpHost = null;
+          this.httpPort = null;
         }
 
         clearTimeout(timeoutHandle);
